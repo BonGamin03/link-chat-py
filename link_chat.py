@@ -1,16 +1,18 @@
-import argparse
-import json
+
+import sys
 import os
 import socket
 import struct
-import sys
 import threading
 import time
+import json
+import argparse
 import uuid
 
-
+# EtherType personalizado
 ETHER_TYPE = 0x88B5
 
+# Códigos de tipo de trama
 BROADCAST = 1
 MESSAGE = 2
 BEGIN = 3
@@ -23,6 +25,7 @@ SIZE_DATA_TRAMA = 1024
 
 def mac_to_bytes(mac: str) -> bytes:
     return bytes(int(x, 16) for x in mac.split(':'))
+
 
 def mac_to_string(b: bytes) -> str:
     return ':'.join('{:02x}'.format(x) for x in b)
@@ -45,11 +48,13 @@ def get_interface():
         pass
     return None
 
+
 def retrieve_mac_address(iface: str) -> str:
     path = f'/sys/class/net/{iface}/address'
     with open(path, 'r') as f:
         return f.read().strip()
-    
+
+
 class LinkChat:
     def __init__(self, iface: str, name: str = None):
         self.iface = iface
@@ -72,8 +77,7 @@ class LinkChat:
         self.sock.bind((self.iface, 0))
         # recv no bloqueante
         self.sock.setblocking(False)
-    
-    
+
     def create_frame(self, dst_mac: str, ftype: int, payload: bytes) -> bytes:
         dst = mac_to_bytes(dst_mac)
         src = mac_to_bytes(self.mac)
@@ -82,8 +86,7 @@ class LinkChat:
         # payload: 1 byte type + data
         frame_payload = struct.pack('!B', ftype) + payload
         return header + frame_payload
-    
-    
+
     def send_frame(self, dst_mac: str, ftype: int, data: dict = None, raw: bytes = None):
         if data is not None:
             b = json.dumps(data, ensure_ascii=False).encode('utf-8')
@@ -92,18 +95,13 @@ class LinkChat:
         frame = self.create_frame(dst_mac, ftype, b)
         self.sock.send(frame)
 
-
-
     def broadcast_msg(self):
         data = {'name': self.name, 'node_id': self.node_id, 'mac': self.mac}
         self.send_frame('ff:ff:ff:ff:ff:ff', BROADCAST, data=data)
 
-    
     def send_msg(self, dst_mac: str, message: str):
         data = {'from': self.name, 'node_id': self.node_id, 'text': message}
         self.send_frame(dst_mac, MESSAGE, data=data)
-
-    
 
     def send_file(self, dst_mac: str, path: str):
         filename = os.path.basename(path)
@@ -157,7 +155,120 @@ class LinkChat:
             except Exception:
                 pass
 
-    
+    def unboxing_frame(self, frame: bytes, addr):
+        if len(frame) < 15:
+            return
+        dst = mac_to_string(frame[0:6])
+        src = mac_to_string(frame[6:12])
+        eth = struct.unpack('!H', frame[12:14])[0]
+        payload = frame[14:]
+        if eth != ETHER_TYPE:
+            return
+        if len(payload) < 1:
+            return
+        ftype = payload[0]
+        body = payload[1:]
+
+        # actualizar peer visto
+        self.connected_peers[src] = {'last_seen': time.time(), 'mac': src}
+
+        if ftype == BROADCAST:
+            try:
+                info = json.loads(body.decode('utf-8'))
+                self.connected_peers[src].update({'name': info.get('name'), 'node_id': info.get('node_id')})
+            except Exception:
+                pass
+        elif ftype == MESSAGE:
+            try:
+                info = json.loads(body.decode('utf-8'))
+                print(f"\n[MENSAJE] {info.get('from')} ({src}): {info.get('text')}")
+            except Exception:
+                pass
+        elif ftype == BEGIN:
+            try:
+                info = json.loads(body.decode('utf-8'))
+                tid = info.get('transfer_id')
+                fname = info.get('filename')
+                size = info.get('size')
+
+                print(f"\n[ARCHIVO] Auto-aceptando archivo de {src}: {fname} ({size} bytes)")
+                out_path = f"recibido_{tid}_{fname}"
+                self.active_transfers[(src, tid)] = {'f': open(out_path, 'wb'), 'expected_seq': 0, 'filename': fname, 'out_path': out_path}
+                print(f"Recibiendo en {out_path}")
+
+            except Exception as e:
+                print('FILE_START malformado', e)
+        elif ftype == CHUNK:
+            # payload: 2 bytes meta_len, meta json, luego fragmento crudo
+            if len(body) < 2:
+                return
+            meta_len = struct.unpack('!H', body[:2])[0]
+            if len(body) < 2 + meta_len:
+                return
+            meta = body[2:2+meta_len]
+            chunk = body[2+meta_len:]
+            try:
+                j = json.loads(meta.decode('utf-8'))
+            except Exception:
+                return
+            tid = j.get('transfer_id')
+            seq = j.get('seq')
+            key = (src, tid)
+            state = self.active_transfers.get(key)
+            if state is None:
+                # no aceptado o desconocido
+                return
+            # verificación ingenua de orden
+            if seq == state['expected_seq']:
+                try:
+                    state['f'].write(chunk)
+                    state['f'].flush()  # asegurar que los datos se escriban inmediatamente
+                    state['expected_seq'] += 1
+                    print(f"[ARCHIVO] Fragmento recibido {seq} ({len(chunk)} bytes)")
+                except Exception as e:
+                    print(f"[ARCHIVO] Error escribiendo fragmento {seq}: {e}")
+            else:
+                print(f"[ARCHIVO] Fragmento fuera de orden: esperado {state['expected_seq']}, recibido {seq}")
+        elif ftype == COMPLETE:
+            try:
+                info = json.loads(body.decode('utf-8'))
+                tid = info.get('transfer_id')
+                key = (src, tid)
+                state = self.active_transfers.get(key)
+                if state is None:
+                    return
+                # cerrar archivo y verificar
+                try:
+                    state['f'].flush()
+                    state['f'].close()
+                    # verificar tamaño del archivo
+                    out_path = state.get('out_path')
+                    if out_path and os.path.exists(out_path):
+                        actual_size = os.path.getsize(out_path)
+                        print(f"\n[ARCHIVO] Transferencia {tid} completada -> {out_path} ({actual_size} bytes)")
+                    else:
+                        print(f"\n[ARCHIVO] Transferencia {tid} completada pero archivo no encontrado!")
+                except Exception as e:
+                    print(f"[ARCHIVO] Error cerrando archivo: {e}")
+                    out_path = state.get('out_path')
+                # post-proceso: si es archivo comprimido, intentar extraer
+                if out_path and (out_path.endswith('.tar') or out_path.endswith('.tar.gz') or out_path.endswith('.tgz')):
+                    import tarfile
+                    try:
+                        extract_dir = out_path + '_extraido'
+                        with tarfile.open(out_path, 'r:*') as tf:
+                            tf.extractall(path=extract_dir)
+                        print(f"[ARCHIVO] Archivo comprimido extraído en {extract_dir}")
+                    except Exception as e:
+                        print('No se pudo extraer el archivo comprimido:', e)
+                # limpiar estado
+                try:
+                    del self.active_transfers[key]
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
     def loop_for_frames(self):
         while self.running:
             try:
@@ -177,8 +288,6 @@ class LinkChat:
             self.broadcast_msg()
             time.sleep(5)
 
-    
-    
     def start(self):
         self.initialize_socket()
         self.running = True
@@ -191,6 +300,7 @@ class LinkChat:
             self.sock.close()
         except Exception:
             pass
+
 
 def console_interface(node: LinkChat):
     print('Terminal LinkChat. Escriba "ayuda" para ver comandos disponibles.')
