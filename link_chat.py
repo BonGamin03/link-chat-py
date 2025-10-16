@@ -48,7 +48,7 @@ def get_interface():
         pass
     return None
 
-
+#Guarda la mac a la hora de crear la instancia de LinkChat 
 def retrieve_mac_address(iface: str) -> str:
     path = f'/sys/class/net/{iface}/address'
     with open(path, 'r') as f:
@@ -73,8 +73,8 @@ class LinkChat:
         self.active_transfers = {}
 
     def initialize_socket(self):
-        self.sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(ETHER_TYPE))
-        self.sock.bind((self.iface, 0))
+        self.sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(ETHER_TYPE)) #Se define un protocolo de comunicacion 
+        self.sock.bind((self.iface, 0)) #Vincula el socket a la interfaz de red
         # recv no bloqueante
         self.sock.setblocking(False)
 
@@ -192,7 +192,7 @@ class LinkChat:
                 size = info.get('size')
 
                 print(f"\n[ARCHIVO] Auto-aceptando archivo de {src}: {fname} ({size} bytes)")
-                out_path = f"recibido_{tid}_{fname}"
+                out_path = f"Hablateee_{fname}"
                 self.active_transfers[(src, tid)] = {'f': open(out_path, 'wb'), 'expected_seq': 0, 'filename': fname, 'out_path': out_path}
                 print(f"Recibiendo en {out_path}")
 
@@ -347,7 +347,7 @@ def console_interface(node: LinkChat):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='EtherNet-Comm: Mensajero a nivel de capa Ethernet')
+    parser = argparse.ArgumentParser(description='LinkChat: Mensajero a nivel de capa de enlace')
     parser.add_argument('-i', '--interfaz', help='Interfaz de red a utilizar (ej. eth0)')
     parser.add_argument('-n', '--nombre', help='Nombre para mostrar')
     args = parser.parse_args()
@@ -361,7 +361,7 @@ def main():
         print('No se encontró interfaz adecuada. Especifique con -i')
         sys.exit(1)
 
-    node = LinkChat(iface, name=args.nombre)
+    node = LinkChat(iface, name=args.nombre) # aqui tengo que ver que es el  name que no se que hace  
     try:
         node.start()
     except PermissionError:
